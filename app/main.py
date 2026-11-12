@@ -1,46 +1,70 @@
-"""HTTP API for multi-center DICOM ingestion.
+"""HTTP API for multi-center DICOM ingestion and batch withdrawal.
 
 Endpoints
 ---------
-POST /api/v1/batches                 upload a batch (multipart, <= 20 files)
-GET  /api/v1/batches/{batch_id}      batch status and per-file UID mapping
-GET  /api/v1/batches                 list batches (filter by center)
-GET  /api/v1/instances               search instances / inspect UID mapping
-GET  /api/v1/instances/{id}/download download the rewritten DICOM object
-GET  /api/v1/references/pending      reference-first bookkeeping per center
-GET  /healthz                        liveness probe
-GET  /docs                           interactive Swagger UI
+POST /api/v1/batches                   upload a batch (multipart, <= 20 files)
+GET  /api/v1/batches/{batch_id}        batch status and per-file UID mapping
+GET  /api/v1/batches                   list batches (filter by center)
+GET  /api/v1/instances                 search instances / inspect UID mapping
+GET  /api/v1/instances/{id}/download   download the rewritten DICOM object
+GET  /api/v1/references/pending        reference-first bookkeeping per center
+POST /api/v1/withdrawals               atomically withdraw 1-20 instances
+GET  /api/v1/withdrawals               list withdrawal requests
+GET  /api/v1/withdrawals/{id}          withdrawal status + per-file cleanup
+GET  /api/v1/cleanup/errors            pending/failed file-cleanup items
+POST /api/v1/cleanup/retry             trigger a cleanup retry sweep now
+GET  /healthz                          liveness probe
+GET  /docs                             interactive Swagger UI
 """
 from __future__ import annotations
 
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from . import config
-from .config import MAX_FILE_BYTES, MAX_FILES_PER_BATCH
+from . import config, withdrawal
+from .config import MAX_FILE_BYTES, MAX_FILES_PER_BATCH, MAX_WITHDRAWAL_IDS
 from .db import get_connection, init_db
 from .service import IngestionError, UploadedFile, ingest_batch
+from .withdrawal import (
+    WithdrawalError,
+    list_cleanup_errors,
+    list_withdrawals,
+    process_pending_cleanups,
+    request_withdrawal,
+    start_cleanup_sweeper,
+    get_withdrawal,
+)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     # Create / migrate the schema before accepting traffic.
     init_db()
-    yield
+    # Continue cleaning files left over from a previous process incarnation.
+    process_pending_cleanups()
+    stop_event = threading.Event()
+    start_cleanup_sweeper(stop_event)
+    try:
+        yield
+    finally:
+        stop_event.set()
 
 
 app = FastAPI(
-    title="Multi-Center DICOM Ingest API",
-    version="1.0.0",
+    title="Multi-Center DICOM Ingest & Withdrawal API",
+    version="1.1.0",
     lifespan=lifespan,
     description=(
         "Ingests Explicit VR Little Endian DICOM objects from multiple source "
         "centers, deterministically remaps every instance/study/series UID "
         "(including nested references) per center, and guarantees atomic, "
-        "idempotent batches."
+        "idempotent batches. Also supports atomic per-center batch withdrawal "
+        "of mistakenly ingested instances, with reference-blocking checks, "
+        "UID-mapping retention, safe re-upload and retryable file cleanup."
     ),
 )
 
@@ -98,6 +122,98 @@ class PendingReference(BaseModel):
     new_referenced_uid: str
     source_instance_id: int
     resolved: bool
+
+
+# --------------------------------------------------------------------------- #
+# Withdrawal schemas
+# --------------------------------------------------------------------------- #
+class WithdrawalRequest(BaseModel):
+    center_id: str = Field(
+        ..., description="Center that owns every target instance."
+    )
+    instance_ids: list[int] = Field(
+        ...,
+        description=(
+            f"1-{MAX_WITHDRAWAL_IDS} ingested instance ids of this center to "
+            "withdraw in one atomic operation."
+        ),
+    )
+
+
+class BlockingReference(BaseModel):
+    reference_id: int
+    center_id: str
+    source_instance_id: int
+    source_original_sop_uid: str
+    source_new_sop_uid: str
+    blocked_referenced_uid: str
+    blocked_original_uid: str
+
+
+class WithdrawalResult(BaseModel):
+    withdrawal_id: str
+    center_id: str
+    status: str
+    requested_count: int
+    removed_count: int
+    reason: str | None
+    blockers: list[BlockingReference]
+
+
+class WithdrawalItem(BaseModel):
+    id: int
+    withdrawal_id: str
+    center_id: str
+    instance_id: int
+    original_sop_uid: str
+    new_sop_uid: str
+    sha256: str
+    stored_path: str
+    cleanup_status: str
+    cleanup_error: str | None
+    cleanup_attempts: int
+    skip_reason: str | None
+    cleaned_at: str | None
+    created_at: str
+
+
+class WithdrawalDetail(BaseModel):
+    withdrawal_id: str
+    center_id: str
+    status: str
+    requested_count: int
+    removed_count: int
+    reason: str | None
+    created_at: str
+    blockers: list[BlockingReference]
+    items: list[WithdrawalItem]
+
+
+class WithdrawalSummary(BaseModel):
+    withdrawal_id: str
+    center_id: str
+    status: str
+    requested_count: int
+    removed_count: int
+    reason: str | None
+    created_at: str
+    blockers: list[BlockingReference]
+
+
+class CleanupItem(BaseModel):
+    id: int
+    withdrawal_id: str
+    center_id: str
+    instance_id: int
+    original_sop_uid: str
+    new_sop_uid: str
+    stored_path: str
+    cleanup_status: str
+    cleanup_error: str | None
+    cleanup_attempts: int
+    skip_reason: str | None
+    cleaned_at: str | None
+    created_at: str
 
 
 # --------------------------------------------------------------------------- #
@@ -305,6 +421,101 @@ def pending_references(
         return [PendingReference(**dict(r)) for r in rows]
     finally:
         conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# Batch withdrawal
+# --------------------------------------------------------------------------- #
+@app.post(
+    "/api/v1/withdrawals",
+    response_model=WithdrawalResult,
+    tags=["withdrawals"],
+    summary="Withdraw 1-20 ingested instances of one center atomically",
+    responses={
+        409: {
+            "description": (
+                "Blocked: an instance outside the submitted set references a "
+                "withdrawal target. The whole request is rejected and the "
+                "blocking references are listed in the body."
+            )
+        },
+        404: {"description": "An instance id is unknown, already withdrawn or "
+                             "owned by another center."},
+        422: {"description": "Malformed payload (bad center, empty/oversized id list)."},
+    },
+)
+def create_withdrawal(payload: WithdrawalRequest) -> WithdrawalResult:
+    try:
+        result = request_withdrawal(payload.center_id, payload.instance_ids)
+    except WithdrawalError as exc:
+        raise HTTPException(exc.http_status, str(exc)) from exc
+    if result["status"] == "rejected":
+        # The rejection is persisted; surface it as a conflict with the full
+        # blocker list so the caller knows exactly which references block it.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "message": "withdrawal rejected; blocking references found",
+                "withdrawal": result,
+            },
+        )
+    return WithdrawalResult(**result)
+
+
+@app.get(
+    "/api/v1/withdrawals",
+    response_model=list[WithdrawalSummary],
+    tags=["withdrawals"],
+    summary="List withdrawal requests (committed and rejected), by center",
+)
+def get_withdrawals(
+    center_id: str | None = Query(None),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> list[WithdrawalSummary]:
+    rows = list_withdrawals(center_id, limit, offset)
+    return [WithdrawalSummary(**row) for row in rows]
+
+
+@app.get(
+    "/api/v1/withdrawals/{withdrawal_id}",
+    response_model=WithdrawalDetail,
+    tags=["withdrawals"],
+    summary="Withdrawal status with per-instance file-cleanup state",
+)
+def get_one_withdrawal(withdrawal_id: str) -> WithdrawalDetail:
+    try:
+        result = get_withdrawal(withdrawal_id)
+    except WithdrawalError as exc:
+        raise HTTPException(exc.http_status, str(exc)) from exc
+    return WithdrawalDetail(**result)
+
+
+# --------------------------------------------------------------------------- #
+# File cleanup operations / errors
+# --------------------------------------------------------------------------- #
+@app.get(
+    "/api/v1/cleanup/errors",
+    response_model=list[CleanupItem],
+    tags=["cleanup"],
+    summary="List file-cleanup items still pending or in error",
+)
+def get_cleanup_errors(
+    center_id: str | None = Query(
+        None, description="Optional center filter; defaults to all centers."
+    ),
+) -> list[CleanupItem]:
+    return [CleanupItem(**row) for row in list_cleanup_errors(center_id)]
+
+
+@app.post(
+    "/api/v1/cleanup/retry",
+    tags=["cleanup"],
+    summary="Trigger an immediate retry sweep of pending/failed file cleanups",
+)
+def retry_cleanup() -> dict:
+    # Safe to call at any time: ownership re-checks prevent mis-deletion.
+    return process_pending_cleanups()
 
 
 @app.get("/healthz", tags=["system"], summary="Liveness/readiness probe")

@@ -95,6 +95,49 @@ CREATE TABLE IF NOT EXISTS batches (
     FOREIGN KEY (center_id) REFERENCES centers (center_id)
 );
 CREATE INDEX IF NOT EXISTS idx_batches_center ON batches (center_id);
+
+-- Batch withdrawal requests. A rejected request (blocking references found)
+-- is persisted too, so operators can audit every removal attempt. ``blockers``
+-- carries the JSON-encoded blocking reference list when status = 'rejected'.
+CREATE TABLE IF NOT EXISTS withdrawal_requests (
+    withdrawal_id     TEXT PRIMARY KEY,
+    center_id         TEXT NOT NULL,
+    status            TEXT NOT NULL CHECK (status IN ('committed', 'rejected')),
+    requested_count   INTEGER NOT NULL,
+    removed_count     INTEGER NOT NULL DEFAULT 0,
+    reason            TEXT,
+    blockers          TEXT,
+    created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_withdrawals_center
+    ON withdrawal_requests (center_id);
+
+-- Snapshot of every instance covered by a *committed* withdrawal. Instance rows
+-- are hard-deleted, so this table is also the work queue for asynchronous file
+-- cleanup. The stored_path snapshot lets a late cleanup run verify ownership
+-- before unlinking, which protects re-uploaded and unrelated objects.
+CREATE TABLE IF NOT EXISTS withdrawal_items (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    withdrawal_id       TEXT NOT NULL,
+    center_id           TEXT NOT NULL,
+    instance_id         INTEGER NOT NULL,
+    original_sop_uid    TEXT NOT NULL,
+    new_sop_uid         TEXT NOT NULL,
+    sha256              TEXT NOT NULL,
+    stored_path         TEXT NOT NULL,
+    cleanup_status      TEXT NOT NULL DEFAULT 'pending'
+        CHECK (cleanup_status IN ('pending', 'done', 'error')),
+    cleanup_error       TEXT,
+    cleanup_attempts    INTEGER NOT NULL DEFAULT 0,
+    skip_reason         TEXT,
+    cleaned_at          TEXT,
+    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    FOREIGN KEY (withdrawal_id) REFERENCES withdrawal_requests (withdrawal_id)
+);
+CREATE INDEX IF NOT EXISTS idx_withdrawal_items_cleanup
+    ON withdrawal_items (cleanup_status);
+CREATE INDEX IF NOT EXISTS idx_withdrawal_items_request
+    ON withdrawal_items (withdrawal_id);
 """
 
 

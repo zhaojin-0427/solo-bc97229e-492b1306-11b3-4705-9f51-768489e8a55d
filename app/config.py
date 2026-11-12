@@ -31,6 +31,15 @@ EXPLICIT_VR_LITTLE_ENDIAN = "1.2.840.10008.1.2.1"
 # SQLite busy timeout (milliseconds) for concurrent writers.
 BUSY_TIMEOUT_MS = int(os.getenv("DICOM_INGEST_BUSY_TIMEOUT_MS", "30000"))
 
+# Background sweep interval (seconds) for retrying failed object-file cleanups.
+CLEANUP_SWEEP_INTERVAL_S = float(
+    os.getenv("DICOM_INGEST_CLEANUP_INTERVAL_S", "10")
+)
+
+# A withdrawal batch carries at most this many instance ids (product
+# requirement: 1-20).
+MAX_WITHDRAWAL_IDS = int(os.getenv("DICOM_INGEST_MAX_WITHDRAWAL_IDS", "20"))
+
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)

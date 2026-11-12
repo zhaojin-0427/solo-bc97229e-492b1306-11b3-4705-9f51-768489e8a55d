@@ -11,6 +11,8 @@ services:
       # All state (SQLite DB + rewritten objects) lives in this mounted volume.
       DICOM_INGEST_DATA_DIR: /data
       DICOM_INGEST_MAX_FILES: "20"
+      DICOM_INGEST_MAX_WITHDRAWAL_IDS: "20"
+      DICOM_INGEST_CLEANUP_INTERVAL_S: "10"
       DICOM_INGEST_UID_ROOT: "2.25"
     volumes:
       - dicom-data:/data
